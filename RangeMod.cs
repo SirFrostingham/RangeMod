@@ -158,6 +158,44 @@ public class RangeMod : IMod
         return false; // skip original Burst scan
     }
 
+    // EXECUTION PATH FIX:
+    // InventoryUpdateSystem::ProcessInventoryChange calls
+    //   InventoryUtility.GetNearbyChestsForCraftingByDistance(pos&, world&, invLookup&, transformLookup&, inventories&)
+    // directly — a Burst-compiled method with a HARDCODED 10f range and NO maxDistance parameter.
+    // This call happens server-side to build the inventoryEntities list that is then passed to
+    //   InventoryUtility.RepairOrReinforce / InventoryUtility.Craft
+    // It completely bypasses CraftingHandler.GetNearbyChests (our other patch), which is only
+    // used client-side for the UI display pass.
+    //
+    // By prefixing here we intercept BOTH the display call (GetNearbyChests → here) AND the
+    // execution call (ProcessInventoryChange → here) in a single patch.  The position,
+    // physics world, and component lookups are already provided as parameters, so we can do
+    // a 50f scan without any reference to Manager.main or the player.
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoryUtility), "GetNearbyChestsForCraftingByDistance")]
+    public static bool GetNearbyChestsForCraftingByDistancePrefix(
+        ref float3 position,
+        ref CollisionWorld collisionWorld,
+        ref ComponentLookup<InventoryAutoTransferEnabledCD> inventoryAutoTransferEnabledLookup,
+        ref ComponentLookup<LocalTransform> localTransformLookup,
+        ref NativeList<Entity> inventories)
+    {
+        if (!inventories.IsCreated) return true; // safety: let Burst handle unexpected state
+
+        var extended = InventoryUtility.GetNearbyChestsByDistance(
+            position, collisionWorld,
+            inventoryAutoTransferEnabledLookup, localTransformLookup,
+            EXTENDED_RANGE, MAX_CHESTS, Allocator.TempJob);
+
+        inventories.Clear();
+        for (int i = 0; i < extended.Length; i++)
+            inventories.Add(extended[i]);
+        extended.Dispose();
+
+        Debug.Log($"[{NAME}]: Crafting execution scan: {inventories.Length} chest(s) in {EXTENDED_RANGE}u @ {position}.");
+        return false; // skip the Burst 10f scan
+    }
+
     // ── HasMaterialsInCraftingInventoryToCraftRecipe (overload: index) ────────
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "HasMaterialsInCraftingInventoryToCraftRecipe",
