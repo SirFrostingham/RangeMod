@@ -31,8 +31,11 @@ Copy-Item "$Staged\*" $Dest -Recurse -Force
 Write-Host "[RangeMod] Installed to: $Dest"
 
 # ---- 3. Create distributable zip ----------------------------
+# Use "$Staged\*" (not $Staged) so the zip root contains ModManifest.json + Scripts/
+# directly, without a RangeMod\ wrapper folder. mod.io places the zip contents
+# into the mod folder automatically, so the extra wrapper causes double-nesting.
 if (Test-Path $ZipOut) { Remove-Item $ZipOut -Force }
-Compress-Archive -Path $Staged -DestinationPath $ZipOut
+Compress-Archive -Path "$Staged\*" -DestinationPath $ZipOut
 Write-Host "[RangeMod] Zip created: $ZipOut"
 
 # ---- 4. Cleanup staged folder --------------------------------
