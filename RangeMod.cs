@@ -30,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.0";
+    public const string VERSION = "1.1.1";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -304,48 +304,88 @@ public class RangeMod : IMod
     private static void ToggleRepairExtendImpl(SalvageAndRepairUI __instance)
     {
         var player = Manager.main?.player;
-        if (player == null) return;
+        if (player == null) { Debug.Log($"[{NAME}]: ToggleRepair: no player"); return; }
 
-        // GetRequiredMaterials returns one MaterialInfo per needed ingredient:
-        //   .objectID        -- the scrap/ingredient type
-        //   .amountNeeded    -- total required
-        //   .amountAvailable -- already reachable (player inv + <=10f chests)
         var mats = __instance.GetRequiredMaterials(false, false);
-        if (mats == null || mats.Count == 0) return;
+        if (mats == null || mats.Count == 0)
+        {
+            Debug.Log($"[{NAME}]: ToggleRepair: no required materials returned");
+            return;
+        }
 
-        bool anyShortfall = false;
-        foreach (var mat in mats)
-            if (mat.amountNeeded > 0 && mat.amountAvailable < mat.amountNeeded)
-                { anyShortfall = true; break; }
-        if (!anyShortfall) return;      // vanilla has enough, nothing to supplement
+        Debug.Log($"[{NAME}]: ToggleRepair: {mats.Count} material type(s) needed");
 
         var em              = player.querySystem.EntityManager;
         var invHandler      = player.playerInventoryHandler;
         var playerInvEntity = invHandler.inventoryEntity;
-        if (!em.HasBuffer<ContainedObjectsBuffer>(playerInvEntity)) return;
+        if (!em.HasBuffer<ContainedObjectsBuffer>(playerInvEntity))
+        {
+            Debug.LogWarning($"[{NAME}]: ToggleRepair: no ContainedObjectsBuffer on player inventory entity");
+            return;
+        }
 
         var playerBuf = em.GetBuffer<ContainedObjectsBuffer>(playerInvEntity);
         int startPos  = invHandler.startPosInBuffer;
         int invSize   = invHandler.size;
 
-        var playerPos = (float3)player.WorldPosition;
-        var allChests = SearchForNearbyChests(playerPos); // 50f scan
+        // Count how much of each required material the player currently holds.
+        // We do NOT trust mat.amountAvailable because our GetNearbyChests patch
+        // makes it count the full 50f radius, but the repair Burst job only
+        // scans 10f - so the game shows "enough" even when the actual job fails.
+        var playerHas = new Dictionary<ObjectID, int>();
+        for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
+        {
+            var slot = playerBuf[s];
+            if (slot.amount <= 0) continue;
+            int cur;
+            playerHas.TryGetValue(slot.objectID, out cur);
+            playerHas[slot.objectID] = cur + slot.amount;
+        }
 
+        // Also count what's in near chests (<=10f) so we don't over-stage.
+        var playerPos  = (float3)player.WorldPosition;
+        var allChests  = SearchForNearbyChests(playerPos); // 50f scan (cached)
+        var nearHas    = new Dictionary<ObjectID, int>();
+        foreach (var chestEntity in allChests)
+        {
+            if (!em.Exists(chestEntity)) continue;
+            if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
+            var ct = em.GetComponentData<LocalTransform>(chestEntity);
+            if (math.distance(playerPos, ct.Position) > DEFAULT_RANGE + 0.5f) continue;
+            if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
+            var cb = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
+            foreach (var slot in cb)
+            {
+                if (slot.amount <= 0) continue;
+                int cur;
+                nearHas.TryGetValue(slot.objectID, out cur);
+                nearHas[slot.objectID] = cur + slot.amount;
+            }
+        }
+
+        bool staged = false;
         foreach (var mat in mats)
         {
-            int deficit = mat.amountNeeded - mat.amountAvailable;
+            if (mat.amountNeeded <= 0) continue;
+
+            int playerHasCount, nearHasCount;
+            playerHas.TryGetValue(mat.objectID, out playerHasCount);
+            nearHas.TryGetValue(mat.objectID, out nearHasCount);
+            int alreadyReachable = playerHasCount + nearHasCount;
+            int deficit = mat.amountNeeded - alreadyReachable;
+
+            Debug.Log($"[{NAME}]: ToggleRepair: {mat.objectID} need={mat.amountNeeded} playerHas={playerHasCount} nearHas={nearHasCount} deficit={deficit}");
+
             if (deficit <= 0) continue;
 
+            // Pull from far chests to cover the deficit
             foreach (var chestEntity in allChests)
             {
                 if (deficit <= 0) break;
                 if (!em.Exists(chestEntity)) continue;
                 if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
-
                 var ct = em.GetComponentData<LocalTransform>(chestEntity);
-                // Skip chests the vanilla 10f scan can already reach
                 if (math.distance(playerPos, ct.Position) <= DEFAULT_RANGE + 0.5f) continue;
-
                 if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
                 var chestBuf = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
 
@@ -354,20 +394,18 @@ public class RangeMod : IMod
                     var slot = chestBuf[i];
                     if (slot.objectID != mat.objectID || slot.amount <= 0) continue;
 
-                    // Find an empty slot in player main inventory
                     int freeAbs = -1;
                     for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
                         if (playerBuf[s].amount == 0) { freeAbs = s; break; }
                     if (freeAbs < 0)
                     {
-                        Debug.LogWarning($"[{NAME}]: Repair: player inventory full, cannot stage more materials.");
+                        Debug.LogWarning($"[{NAME}]: ToggleRepair: player inventory full.");
                         break;
                     }
 
-                    // Move whole slot: chest -> player inventory
-                    var saved      = chestBuf[i];
-                    chestBuf[i]    = default;        // mark chest slot empty
-                    playerBuf[freeAbs] = saved;      // place in player inventory
+                    var saved       = chestBuf[i];
+                    chestBuf[i]     = default;
+                    playerBuf[freeAbs] = saved;
 
                     _pendingRestores.Add(new MovedItemRecord
                     {
@@ -378,13 +416,16 @@ public class RangeMod : IMod
                     });
 
                     deficit -= saved.amount;
-                    Debug.Log($"[{NAME}]: Repair staged: {saved.amount}x {saved.objectID} from far chest -> player[{freeAbs}], deficit={deficit}");
+                    staged   = true;
+                    Debug.Log($"[{NAME}]: Repair staged: {saved.amount}x {saved.objectID} -> player[{freeAbs}], deficit now={deficit}");
                 }
             }
         }
 
-        if (_pendingRestores.Count > 0)
-            Debug.Log($"[{NAME}]: Repair: staged {_pendingRestores.Count} slot(s) from far chests.");
+        if (staged)
+            Debug.Log($"[{NAME}]: Repair: staged {_pendingRestores.Count} slot(s) from far chests into player inventory.");
+        else
+            Debug.Log($"[{NAME}]: Repair: nothing to stage (all materials already reachable within 10f).");
     }
 
     [HarmonyPostfix]
