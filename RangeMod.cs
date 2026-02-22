@@ -30,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.2";
+    public const string VERSION = "1.1.3";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -217,6 +217,16 @@ public class RangeMod : IMod
         Debug.Log($"[{NAME}]: Quick-deposit scan: {__result.Length} chest(s) in {EXTENDED_RANGE}u @ {position}.");
         return false; // skip the hardcoded-range original
     }
+
+    // QuickStackItemToNearbyChests skips any item where isStackable == false.
+    // Non-stackable consumables (bombs, throwables, etc.) are tagged that way
+    // in ObjectInfo and therefore never quick-deposit regardless of range.
+    // We force isStackable = true so every item is eligible; the vanilla code
+    // still only deposits to chests that already contain a matching stack.
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoryUtility), "QuickStackItemToNearbyChests")]
+    public static void QuickStackItemToNearbyChestsPrefix(ref bool isStackable)
+        => isStackable = true;
 
     // ── HasMaterialsInCraftingInventoryToCraftRecipe (overload: index) ────────
     [HarmonyPrefix]
