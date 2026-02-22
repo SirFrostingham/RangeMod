@@ -1,6 +1,9 @@
 # Credentials — never commit
 secrets.ps1
 
+# Tools
+tools/
+
 # Build artifacts
 _staged/
 *.zip
