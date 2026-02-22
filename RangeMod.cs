@@ -47,6 +47,14 @@ public class RangeMod : IMod
     private static int   _lastCachedFrame = -1;
     private static float3 _lastCachedPos  = float3.zero;
 
+    // Cached reflection handles for CraftingHandler private fields.
+    // AccessTools (HarmonyLib) is used instead of Traverse — the game's Roslyn
+    // security sandbox blocks Traverse but permits AccessTools + FieldInfo.
+    private static readonly System.Reflection.FieldInfo _fEntityMonoBehaviour =
+        AccessTools.Field(typeof(CraftingHandler), "entityMonoBehaviour");
+    private static readonly System.Reflection.FieldInfo _fCachedNearbyChests =
+        AccessTools.Field(typeof(CraftingHandler), "cachedNearbyChests");
+
     private LoadedMod modInfo;
 
     // -------------------------------------------------------------------------
@@ -104,9 +112,7 @@ public class RangeMod : IMod
     // Falls back to the player's position if the private field is inaccessible.
     private static float3 GetStationPosition(CraftingHandler instance)
     {
-        var emb = Traverse.Create(instance)
-                          .Field("entityMonoBehaviour")
-                          .GetValue<EntityMonoBehaviour>();
+        var emb = _fEntityMonoBehaviour?.GetValue(instance) as EntityMonoBehaviour;
         if (emb != null)
             return (float3)emb.WorldPosition;
 
@@ -128,7 +134,7 @@ public class RangeMod : IMod
     //      cached position check uses player pos to gate the scan.
     //   3. Write-back: vanilla stores the result in the private instance field
     //      `cachedNearbyChests`. Our prefix skips the original, so we must write it
-    //      back ourselves via Traverse. InventoryUpdateSystem::ProcessInventoryChange
+    //      back ourselves via FieldInfo (AccessTools). InventoryUpdateSystem::ProcessInventoryChange
     //      reads that field directly during the actual material consumption — it does
     //      NOT call GetNearbyChests() again. Without write-back, the repair/craft
     //      action always sees an empty list even if the display showed materials available.
@@ -149,9 +155,7 @@ public class RangeMod : IMod
 
             // Write into the private instance field so ECS systems that read it
             // directly (e.g. InventoryUpdateSystem) see the extended list too.
-            Traverse.Create(__instance)
-                    .Field("cachedNearbyChests")
-                    .SetValue(cachedNearbyChests);
+            _fCachedNearbyChests?.SetValue(__instance, cachedNearbyChests);
         }
 
         __result = cachedNearbyChests;
