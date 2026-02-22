@@ -259,27 +259,25 @@ public class RangeMod : IMod
     [HarmonyPatch(typeof(UIManager), "OnUpgradeForgeOpen")]
     public static void OnUpgradeForgeOpenPrefix() => RefreshCache();
 
-    // ── Diagnostic probes: confirm repair EXECUTION path ─────────────────────
-    // ToggleRepair fires (confirmed) — that's UI only.
-    // We need to find which managed method schedules the Burst repair job.
+    // ── Diagnostic probes ─────────────────────────────────────────────────────
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(SalvageAndRepairUI), "ToggleRepair")]
-    public static void ToggleRepairProbe()
-        => Debug.Log($"[{NAME}]: ToggleRepair PROBE fired!");
+    public static void ToggleRepairProbe(SalvageAndRepairUI __instance)
+        => Debug.Log($"[{NAME}]: ToggleRepair PROBE — isReinforce={__instance?.isReinforce}");
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(SalvageAndRepairUI), "RepairOrReinforce")]
-    public static void RepairOrReinforceUIPROBE()
+    public static void RepairOrReinforceUIProbe()
         => Debug.Log($"[{NAME}]: SalvageAndRepairUI.RepairOrReinforce PROBE fired!");
 
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(Inventory.InventoryUpdateSystem), "ProcessInventoryChange")]
-    public static void ProcessInventoryChangePROBE()
-        => Debug.Log($"[{NAME}]: InventoryUpdateSystem.ProcessInventoryChange PROBE fired!");
+    [HarmonyPatch(typeof(InventoryUtility), "RepairOrReinforce")]
+    public static void InventoryUtilityRepairOrReinforceProbe()
+        => Debug.Log($"[{NAME}]: InventoryUtility.RepairOrReinforce PROBE fired!");
 
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(Inventory.InventoryUpdateSystem), "OnUpdate")]
-    public static void InventoryUpdateSystemOnUpdatePROBE()
-        => Debug.Log($"[{NAME}]: InventoryUpdateSystem.OnUpdate PROBE fired!");
+    [HarmonyPatch(typeof(Inventory.InventoryUpdateSystem), "ProcessInventoryChange")]
+    public static void ProcessInventoryChangeProbe()
+        => Debug.Log($"[{NAME}]: InventoryUpdateSystem.ProcessInventoryChange PROBE fired!");
 }
