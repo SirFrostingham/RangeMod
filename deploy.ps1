@@ -34,9 +34,16 @@ Write-Host "[RangeMod] Installed to: $Dest"
 # Use "$Staged\*" (not $Staged) so the zip root contains ModManifest.json + Scripts/
 # directly, without a RangeMod\ wrapper folder. mod.io places the zip contents
 # into the mod folder automatically, so the extra wrapper causes double-nesting.
-if (Test-Path $ZipOut) { Remove-Item $ZipOut -Force }
-Compress-Archive -Path "$Staged\*" -DestinationPath $ZipOut
-Write-Host "[RangeMod] Zip created: $ZipOut"
+# Write to a temp file first, then replace — avoids lock failures when VS Code
+# or Explorer has the previous zip open.
+$ZipTmp = "$Source\_RangeMod_new.zip"
+if (Test-Path $ZipTmp) { Remove-Item $ZipTmp -Force }
+Compress-Archive -Path "$Staged\*" -DestinationPath $ZipTmp -Force
+if (-not (Test-Path $ZipTmp)) { throw "Zip was not created: $ZipTmp" }
+if (Test-Path $ZipOut) { Remove-Item $ZipOut -Force -ErrorAction SilentlyContinue }
+Move-Item $ZipTmp $ZipOut -Force
+$zipSize = (Get-Item $ZipOut).Length
+Write-Host "[RangeMod] Zip created: $ZipOut ($zipSize bytes, $(Get-Date -Format 'HH:mm:ss'))"
 
 # ---- 4. Cleanup staged folder --------------------------------
 Remove-Item "$Source\_staged" -Recurse -Force
