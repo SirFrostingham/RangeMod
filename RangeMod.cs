@@ -29,7 +29,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.0.5";
+    public const string VERSION = "1.0.9";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 

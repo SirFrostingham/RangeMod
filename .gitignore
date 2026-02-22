@@ -1,0 +1,7 @@
+# Credentials — never commit
+secrets.ps1
+
+# Build artifacts
+_staged/
+*.zip
+RangeMod.zip
