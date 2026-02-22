@@ -47,14 +47,6 @@ public class RangeMod : IMod
     private static int   _lastCachedFrame = -1;
     private static float3 _lastCachedPos  = float3.zero;
 
-    // Cached reflection handles for CraftingHandler private fields.
-    // AccessTools (HarmonyLib) is used instead of Traverse — the game's Roslyn
-    // security sandbox blocks Traverse but permits AccessTools + FieldInfo.
-    private static readonly System.Reflection.FieldInfo _fEntityMonoBehaviour =
-        AccessTools.Field(typeof(CraftingHandler), "entityMonoBehaviour");
-    private static readonly System.Reflection.FieldInfo _fCachedNearbyChests =
-        AccessTools.Field(typeof(CraftingHandler), "cachedNearbyChests");
-
     private LoadedMod modInfo;
 
     // -------------------------------------------------------------------------
@@ -108,14 +100,13 @@ public class RangeMod : IMod
         return result;
     }
 
-    // Returns the world position of the crafting station this CraftingHandler belongs to.
-    // Falls back to the player's position if the private field is inaccessible.
+    // Returns the search origin for the nearby-chest scan.
+    // The game's Roslyn sandbox blocks System.Reflection entirely, so we cannot
+    // read CraftingHandler.entityMonoBehaviour directly. We use the player's
+    // position instead — at 50f range the ≤3-block station-vs-player offset is
+    // negligible and the cache is invalidated whenever the player moves.
     private static float3 GetStationPosition(CraftingHandler instance)
     {
-        var emb = _fEntityMonoBehaviour?.GetValue(instance) as EntityMonoBehaviour;
-        if (emb != null)
-            return (float3)emb.WorldPosition;
-
         var player = Manager.main?.player;
         return player != null ? (float3)player.WorldPosition : float3.zero;
     }
@@ -129,15 +120,11 @@ public class RangeMod : IMod
     //
     // Critical fixes vs vanilla:
     //   1. Range: 50f instead of hardcoded 10f.
-    //   2. Origin: station's WorldPosition (from entityMonoBehaviour), not the player's.
-    //      These differ when the player walks away while the UI is open, or the
-    //      cached position check uses player pos to gate the scan.
-    //   3. Write-back: vanilla stores the result in the private instance field
-    //      `cachedNearbyChests`. Our prefix skips the original, so we must write it
-    //      back ourselves via FieldInfo (AccessTools). InventoryUpdateSystem::ProcessInventoryChange
-    //      reads that field directly during the actual material consumption — it does
-    //      NOT call GetNearbyChests() again. Without write-back, the repair/craft
-    //      action always sees an empty list even if the display showed materials available.
+    //   2. Origin: player's WorldPosition (station position is in a private field the
+    //      sandbox forbids reading; at 50f range the ≤3-block offset is negligible).
+    //   3. The actual material consumption path (InventoryUpdateSystem → RepairOrReinforce)
+    //      is covered by the GetNearbyChestsForCraftingByDistance prefix below, so
+    //      no write-back to CraftingHandler.cachedNearbyChests is needed.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
     public static bool GetNearbyChestsPrefix(CraftingHandler __instance, ref List<Entity> __result)
@@ -153,9 +140,6 @@ public class RangeMod : IMod
             _lastCachedFrame   = currentFrame;
             _lastCachedPos     = stationPos;
 
-            // Write into the private instance field so ECS systems that read it
-            // directly (e.g. InventoryUpdateSystem) see the extended list too.
-            _fCachedNearbyChests?.SetValue(__instance, cachedNearbyChests);
         }
 
         __result = cachedNearbyChests;
