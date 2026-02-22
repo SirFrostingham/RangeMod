@@ -258,4 +258,22 @@ public class RangeMod : IMod
     [HarmonyPrefix]
     [HarmonyPatch(typeof(UIManager), "OnUpgradeForgeOpen")]
     public static void OnUpgradeForgeOpenPrefix() => RefreshCache();
+
+    // ── Diagnostic probes: confirm repair execution path ──────────────────────
+    // These log when called so we can confirm which methods fire on repair/reinforce.
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoryUtility), "RepairOrReinforce")]
+    public static void RepairOrReinforceProbe()
+        => Debug.Log($"[{NAME}]: RepairOrReinforce PROBE fired!");
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(SalvageAndRepairUI), "ToggleRepair")]
+    public static void ToggleRepairProbe()
+        => Debug.Log($"[{NAME}]: ToggleRepair PROBE fired!");
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(SalvageAndRepairUI), "ToggleReinforce")]
+    public static void ToggleReinforceProbe()
+        => Debug.Log($"[{NAME}]: ToggleReinforce PROBE fired!");
 }
