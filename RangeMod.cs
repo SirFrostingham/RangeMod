@@ -74,33 +74,44 @@ public class RangeMod : IMod
     // Chest search — uses the game's own ECS physics API with our range
     // -------------------------------------------------------------------------
 
-    private static List<Entity> SearchForNearbyChests()
+    private static List<Entity> SearchForNearbyChests(float3 originPosition)
     {
         var player = Manager.main?.player;
         if (player == null) return new List<Entity>();
 
-        // Grab ECS-side resources from the player's query system.
-        var querySystem    = player.querySystem;
-        var collisionWorld = querySystem.GetSingleton<PhysicsWorldSingleton>().CollisionWorld;
-        var invLookup      = querySystem.GetComponentLookup<InventoryAutoTransferEnabledCD>(isReadOnly: true);
+        var querySystem     = player.querySystem;
+        var collisionWorld  = querySystem.GetSingleton<PhysicsWorldSingleton>().CollisionWorld;
+        var invLookup       = querySystem.GetComponentLookup<InventoryAutoTransferEnabledCD>(isReadOnly: true);
         var transformLookup = querySystem.GetComponentLookup<LocalTransform>(isReadOnly: true);
-
-        var position = (float3)player.WorldPosition;
 
         // GetNearbyChestsByDistance is the parameterised version of the game's own
         // chest lookup. We pass EXTENDED_RANGE instead of the default 10f.
         var nativeList = InventoryUtility.GetNearbyChestsByDistance(
-            position, collisionWorld, invLookup, transformLookup,
+            originPosition, collisionWorld, invLookup, transformLookup,
             EXTENDED_RANGE, MAX_CHESTS, Allocator.TempJob);
 
         var result = new List<Entity>(nativeList.Length);
         foreach (var entity in nativeList)
             result.Add(entity);
 
-        nativeList.Dispose(); // NativeList must be manually disposed
+        nativeList.Dispose();
 
-        Debug.Log($"[{NAME}]: Found {result.Count} chest(s) within {EXTENDED_RANGE}m.");
+        Debug.Log($"[{NAME}]: Found {result.Count} chest(s) within {EXTENDED_RANGE} units of {originPosition}.");
         return result;
+    }
+
+    // Returns the world position of the crafting station this CraftingHandler belongs to.
+    // Falls back to the player's position if the private field is inaccessible.
+    private static float3 GetStationPosition(CraftingHandler instance)
+    {
+        var emb = Traverse.Create(instance)
+                          .Field("entityMonoBehaviour")
+                          .GetValue<EntityMonoBehaviour>();
+        if (emb != null)
+            return (float3)emb.WorldPosition;
+
+        var player = Manager.main?.player;
+        return player != null ? (float3)player.WorldPosition : float3.zero;
     }
 
     // -------------------------------------------------------------------------
@@ -110,33 +121,37 @@ public class RangeMod : IMod
     // GetNearbyChests() is the source the game reads to know which chests are
     // "nearby". We replace it entirely so it returns our extended list.
     //
-    // Implements the same per-frame + per-position caching the vanilla method uses,
-    // so we don't do a physics scan every single frame, but do refresh whenever the
-    // player moves or a new frame begins (whichever the game would normally react to).
-    // This makes the patch self-sufficient — it does NOT depend on any UI open event
-    // firing first, which was the cause of the fiber (and other material) failures.
+    // Critical fixes vs vanilla:
+    //   1. Range: 50f instead of hardcoded 10f.
+    //   2. Origin: station's WorldPosition (from entityMonoBehaviour), not the player's.
+    //      These differ when the player walks away while the UI is open, or the
+    //      cached position check uses player pos to gate the scan.
+    //   3. Write-back: vanilla stores the result in the private instance field
+    //      `cachedNearbyChests`. Our prefix skips the original, so we must write it
+    //      back ourselves via Traverse. InventoryUpdateSystem::ProcessInventoryChange
+    //      reads that field directly during the actual material consumption — it does
+    //      NOT call GetNearbyChests() again. Without write-back, the repair/craft
+    //      action always sees an empty list even if the display showed materials available.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
-    public static bool GetNearbyChestsPrefix(ref List<Entity> __result)
+    public static bool GetNearbyChestsPrefix(CraftingHandler __instance, ref List<Entity> __result)
     {
-        var player = Manager.main?.player;
-        if (player == null)
-        {
-            __result = cachedNearbyChests;
-            return false;
-        }
-
-        int    currentFrame = Time.frameCount;
-        float3 currentPos   = (float3)player.WorldPosition;
-
-        bool sameFrame    = currentFrame == _lastCachedFrame;
-        bool samePosition = math.all(currentPos == _lastCachedPos);
+        int    currentFrame  = Time.frameCount;
+        float3 stationPos    = GetStationPosition(__instance);
+        bool   sameFrame     = currentFrame == _lastCachedFrame;
+        bool   samePosition  = math.all(stationPos == _lastCachedPos);
 
         if (!sameFrame || !samePosition)
         {
-            cachedNearbyChests = SearchForNearbyChests();
+            cachedNearbyChests = SearchForNearbyChests(stationPos);
             _lastCachedFrame   = currentFrame;
-            _lastCachedPos     = currentPos;
+            _lastCachedPos     = stationPos;
+
+            // Write into the private instance field so ECS systems that read it
+            // directly (e.g. InventoryUpdateSystem) see the extended list too.
+            Traverse.Create(__instance)
+                    .Field("cachedNearbyChests")
+                    .SetValue(cachedNearbyChests);
         }
 
         __result = cachedNearbyChests;
@@ -194,12 +209,16 @@ public class RangeMod : IMod
     // (GetNearbyChests is now self-sufficient, but pre-warming avoids a hitch
     // on the first frame of a crafting session.)
 
+    // Invalidates the per-frame/position sentinels so the next call to
+    // GetNearbyChests() triggers a fresh physics scan from the station's
+    // WorldPosition. We call this from UI-open patches where we don't have
+    // a CraftingHandler __instance, so we can't run the scan here directly.
+    // GetNearbyChestsPrefix handles the actual search and write-back on its
+    // next invocation.
     private static void RefreshCache()
     {
-        cachedNearbyChests = SearchForNearbyChests();
-        _lastCachedFrame   = Time.frameCount;
-        var player = Manager.main?.player;
-        if (player != null) _lastCachedPos = (float3)player.WorldPosition;
+        _lastCachedFrame = -1;
+        _lastCachedPos   = new float3(float.MaxValue, float.MaxValue, float.MaxValue);
     }
 
     [HarmonyPrefix]
