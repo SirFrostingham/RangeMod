@@ -30,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.1";
+    public const string VERSION = "1.1.2";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -194,6 +194,28 @@ public class RangeMod : IMod
 
         Debug.Log($"[{NAME}]: Crafting execution scan: {inventories.Length} chest(s) in {EXTENDED_RANGE}u @ {position}.");
         return false; // skip the Burst 10f scan
+    }
+
+    // GetNearbyChestsForAutoStackingByDistance is the managed (non-Burst) method
+    // that builds the chest list for the Q quick-deposit action. It has no
+    // maxDistance parameter (range is hard-coded inside). We replace it entirely
+    // with a 50f scan using GetNearbyChestsByDistance.
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoryUtility), "GetNearbyChestsForAutoStackingByDistance")]
+    public static bool GetNearbyChestsForAutoStackingByDistancePrefix(
+        float3 position,
+        CollisionWorld collisionWorld,
+        ComponentLookup<InventoryAutoTransferEnabledCD> inventoryAutoTransferEnabledLookup,
+        ComponentLookup<LocalTransform> localTransformLookup,
+        Allocator allocator,
+        ref NativeList<Entity> __result)
+    {
+        __result = InventoryUtility.GetNearbyChestsByDistance(
+            position, collisionWorld,
+            inventoryAutoTransferEnabledLookup, localTransformLookup,
+            EXTENDED_RANGE, MAX_CHESTS, allocator);
+        Debug.Log($"[{NAME}]: Quick-deposit scan: {__result.Length} chest(s) in {EXTENDED_RANGE}u @ {position}.");
+        return false; // skip the hardcoded-range original
     }
 
     // ── HasMaterialsInCraftingInventoryToCraftRecipe (overload: index) ────────
