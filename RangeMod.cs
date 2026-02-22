@@ -41,8 +41,11 @@ public class RangeMod : IMod
     // Upper bound on how many chests to include. 200 is generous for any base layout.
     private const int MAX_CHESTS = 200;
 
-    // Per-crafting-session cache. Rebuilt each time the player opens the crafting UI.
+    // Nearby-chest cache. Rebuilt at most once per frame, or when position changes.
+    // Mirrors the vanilla GetNearbyChests frame+position caching logic.
     public static List<Entity> cachedNearbyChests = new List<Entity>();
+    private static int   _lastCachedFrame = -1;
+    private static float3 _lastCachedPos  = float3.zero;
 
     private LoadedMod modInfo;
 
@@ -106,11 +109,36 @@ public class RangeMod : IMod
 
     // GetNearbyChests() is the source the game reads to know which chests are
     // "nearby". We replace it entirely so it returns our extended list.
-    // (Replaces the old GetAnyNearbyChests — renamed in 1.1+)
+    //
+    // Implements the same per-frame + per-position caching the vanilla method uses,
+    // so we don't do a physics scan every single frame, but do refresh whenever the
+    // player moves or a new frame begins (whichever the game would normally react to).
+    // This makes the patch self-sufficient — it does NOT depend on any UI open event
+    // firing first, which was the cause of the fiber (and other material) failures.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
     public static bool GetNearbyChestsPrefix(ref List<Entity> __result)
     {
+        var player = Manager.main?.player;
+        if (player == null)
+        {
+            __result = cachedNearbyChests;
+            return false;
+        }
+
+        int    currentFrame = Time.frameCount;
+        float3 currentPos   = (float3)player.WorldPosition;
+
+        bool sameFrame    = currentFrame == _lastCachedFrame;
+        bool samePosition = math.all(currentPos == _lastCachedPos);
+
+        if (!sameFrame || !samePosition)
+        {
+            cachedNearbyChests = SearchForNearbyChests();
+            _lastCachedFrame   = currentFrame;
+            _lastCachedPos     = currentPos;
+        }
+
         __result = cachedNearbyChests;
         return false; // skip original Burst scan
     }
@@ -161,14 +189,28 @@ public class RangeMod : IMod
     public static void HasMaterialsToBeUpgradedPrefix(ref List<Entity> nearbyChestsToTakeMaterialsFrom)
         => nearbyChestsToTakeMaterialsFrom = cachedNearbyChests;
 
-    // ── Trigger: rebuild cache when the player opens the crafting/inventory UI ─
+    // ── Eager cache refresh: rebuild when any crafting-related UI opens ──────
+    // These ensure the cache is warm before the first GetNearbyChests call.
+    // (GetNearbyChests is now self-sufficient, but pre-warming avoids a hitch
+    // on the first frame of a crafting session.)
+
+    private static void RefreshCache()
+    {
+        cachedNearbyChests = SearchForNearbyChests();
+        _lastCachedFrame   = Time.frameCount;
+        var player = Manager.main?.player;
+        if (player != null) _lastCachedPos = (float3)player.WorldPosition;
+    }
+
     [HarmonyPrefix]
     [HarmonyPatch(typeof(UIManager), "OnPlayerInventoryOpen")]
-    public static void OnPlayerInventoryOpenPrefix()
-    {
-        if (Manager.main?.player?.activeCraftingHandler != null)
-        {
-            cachedNearbyChests = SearchForNearbyChests();
-        }
-    }
+    public static void OnPlayerInventoryOpenPrefix() => RefreshCache();
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(UIManager), "OnSalvageAndRepairOpen")]
+    public static void OnSalvageAndRepairOpenPrefix() => RefreshCache();
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(UIManager), "OnUpgradeForgeOpen")]
+    public static void OnUpgradeForgeOpenPrefix() => RefreshCache();
 }
