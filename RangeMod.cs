@@ -2,6 +2,7 @@ using HarmonyLib;
 using Inventory;
 using PugMod;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using Unity.Collections;
@@ -29,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.0.9";
+    public const string VERSION = "1.1.0";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -44,8 +45,19 @@ public class RangeMod : IMod
     // Nearby-chest cache. Rebuilt at most once per frame, or when position changes.
     // Mirrors the vanilla GetNearbyChests frame+position caching logic.
     public static List<Entity> cachedNearbyChests = new List<Entity>();
-    private static int   _lastCachedFrame = -1;
-    private static float3 _lastCachedPos  = float3.zero;
+    private static int    _lastCachedFrame = -1;
+    private static float3 _lastCachedPos   = float3.zero;
+
+    // Repair-range extension: tracks items temporarily moved from far chests
+    // to player inventory so the Burst repair job can find them.
+    private struct MovedItemRecord
+    {
+        public Entity                sourceChest;
+        public int                   chestSlotIndex;
+        public ContainedObjectsBuffer slotData;   // full struct copy (objectData + auxDataIndex)
+        public int                   playerBufAbsoluteIndex;
+    }
+    private static readonly List<MovedItemRecord> _pendingRestores = new List<MovedItemRecord>();
 
     private LoadedMod modInfo;
 
@@ -259,25 +271,198 @@ public class RangeMod : IMod
     [HarmonyPatch(typeof(UIManager), "OnUpgradeForgeOpen")]
     public static void OnUpgradeForgeOpenPrefix() => RefreshCache();
 
-    // ── Diagnostic probes ─────────────────────────────────────────────────────
+    // ---- Repair range extension ---------------------------------------------
+    //
+    // After probing, the vanilla repair path is confirmed as:
+    //   ToggleRepair (managed, patchable)
+    //     -> ECB command
+    //       -> ProcessInventoryChangesJob (Burst ISystem)
+    //         -> GetNearbyChestsForCraftingByDistance (Burst, hardcoded 10f)
+    //           -> RepairOrReinforce
+    //
+    // Since everything downstream of ToggleRepair is Burst-compiled and
+    // Harmony-unpatchable, the fix is "inventory stuffing":
+    //   Prefix:  detect which scrap parts are short; move whole slots from
+    //            far chests (10-50f) into the player's main inventory.
+    //   Vanilla: repair Burst job runs, finds the parts in player inventory.
+    //   Postfix: coroutine (3 frames later) moves any unconsumed parts back
+    //            to their original chest slots.
+    //
+    // ToggleReinforce is NOT patched -- reinforce already works because it
+    // draws only from player inventory (no chest scan involved).
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(SalvageAndRepairUI), "ToggleRepair")]
-    public static void ToggleRepairProbe(SalvageAndRepairUI __instance)
-        => Debug.Log($"[{NAME}]: ToggleRepair PROBE — isReinforce={__instance?.isReinforce}");
+    public static void ToggleRepairExtendPrefix(SalvageAndRepairUI __instance)
+    {
+        _pendingRestores.Clear();
+        try   { ToggleRepairExtendImpl(__instance); }
+        catch (Exception ex)
+            { Debug.LogWarning($"[{NAME}]: ToggleRepairPrefix error: {ex.Message}"); }
+    }
 
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(SalvageAndRepairUI), "RepairOrReinforce")]
-    public static void RepairOrReinforceUIProbe()
-        => Debug.Log($"[{NAME}]: SalvageAndRepairUI.RepairOrReinforce PROBE fired!");
+    private static void ToggleRepairExtendImpl(SalvageAndRepairUI __instance)
+    {
+        var player = Manager.main?.player;
+        if (player == null) return;
 
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(InventoryUtility), "RepairOrReinforce")]
-    public static void InventoryUtilityRepairOrReinforceProbe()
-        => Debug.Log($"[{NAME}]: InventoryUtility.RepairOrReinforce PROBE fired!");
+        // GetRequiredMaterials returns one MaterialInfo per needed ingredient:
+        //   .objectID        -- the scrap/ingredient type
+        //   .amountNeeded    -- total required
+        //   .amountAvailable -- already reachable (player inv + <=10f chests)
+        var mats = __instance.GetRequiredMaterials(false, false);
+        if (mats == null || mats.Count == 0) return;
 
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(Inventory.InventoryUpdateSystem), "ProcessInventoryChange")]
-    public static void ProcessInventoryChangeProbe()
-        => Debug.Log($"[{NAME}]: InventoryUpdateSystem.ProcessInventoryChange PROBE fired!");
+        bool anyShortfall = false;
+        foreach (var mat in mats)
+            if (mat.amountNeeded > 0 && mat.amountAvailable < mat.amountNeeded)
+                { anyShortfall = true; break; }
+        if (!anyShortfall) return;      // vanilla has enough, nothing to supplement
+
+        var em              = player.querySystem.EntityManager;
+        var invHandler      = player.playerInventoryHandler;
+        var playerInvEntity = invHandler.inventoryEntity;
+        if (!em.HasBuffer<ContainedObjectsBuffer>(playerInvEntity)) return;
+
+        var playerBuf = em.GetBuffer<ContainedObjectsBuffer>(playerInvEntity);
+        int startPos  = invHandler.startPosInBuffer;
+        int invSize   = invHandler.size;
+
+        var playerPos = (float3)player.WorldPosition;
+        var allChests = SearchForNearbyChests(playerPos); // 50f scan
+
+        foreach (var mat in mats)
+        {
+            int deficit = mat.amountNeeded - mat.amountAvailable;
+            if (deficit <= 0) continue;
+
+            foreach (var chestEntity in allChests)
+            {
+                if (deficit <= 0) break;
+                if (!em.Exists(chestEntity)) continue;
+                if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
+
+                var ct = em.GetComponentData<LocalTransform>(chestEntity);
+                // Skip chests the vanilla 10f scan can already reach
+                if (math.distance(playerPos, ct.Position) <= DEFAULT_RANGE + 0.5f) continue;
+
+                if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
+                var chestBuf = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
+
+                for (int i = chestBuf.Length - 1; i >= 0 && deficit > 0; i--)
+                {
+                    var slot = chestBuf[i];
+                    if (slot.objectID != mat.objectID || slot.amount <= 0) continue;
+
+                    // Find an empty slot in player main inventory
+                    int freeAbs = -1;
+                    for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
+                        if (playerBuf[s].amount == 0) { freeAbs = s; break; }
+                    if (freeAbs < 0)
+                    {
+                        Debug.LogWarning($"[{NAME}]: Repair: player inventory full, cannot stage more materials.");
+                        break;
+                    }
+
+                    // Move whole slot: chest -> player inventory
+                    var saved      = chestBuf[i];
+                    chestBuf[i]    = default;        // mark chest slot empty
+                    playerBuf[freeAbs] = saved;      // place in player inventory
+
+                    _pendingRestores.Add(new MovedItemRecord
+                    {
+                        sourceChest            = chestEntity,
+                        chestSlotIndex         = i,
+                        slotData               = saved,
+                        playerBufAbsoluteIndex = freeAbs
+                    });
+
+                    deficit -= saved.amount;
+                    Debug.Log($"[{NAME}]: Repair staged: {saved.amount}x {saved.objectID} from far chest -> player[{freeAbs}], deficit={deficit}");
+                }
+            }
+        }
+
+        if (_pendingRestores.Count > 0)
+            Debug.Log($"[{NAME}]: Repair: staged {_pendingRestores.Count} slot(s) from far chests.");
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(SalvageAndRepairUI), "ToggleRepair")]
+    public static void ToggleRepairExtendPostfix(SalvageAndRepairUI __instance)
+    {
+        if (_pendingRestores.Count > 0)
+            __instance.StartCoroutine(RestoreUnconsumedMaterialsCoroutine());
+    }
+
+    private static IEnumerator RestoreUnconsumedMaterialsCoroutine()
+    {
+        // Wait several frames for the repair ECB / Burst job to run and consume items.
+        yield return null;
+        yield return null;
+        yield return null;
+
+        var player = Manager.main?.player;
+        if (player == null) { _pendingRestores.Clear(); yield break; }
+
+        try
+        {
+            var em              = player.querySystem.EntityManager;
+            var playerInvEntity = player.playerInventoryHandler.inventoryEntity;
+            if (!em.HasBuffer<ContainedObjectsBuffer>(playerInvEntity))
+                { _pendingRestores.Clear(); yield break; }
+
+            var playerBuf = em.GetBuffer<ContainedObjectsBuffer>(playerInvEntity);
+
+            foreach (var rec in _pendingRestores)
+            {
+                if (rec.playerBufAbsoluteIndex >= playerBuf.Length) continue;
+                var cur = playerBuf[rec.playerBufAbsoluteIndex];
+
+                // If our item is still present (wasn't fully consumed), return it
+                if (cur.objectID != rec.slotData.objectID || cur.amount <= 0) continue;
+
+                bool returned = false;
+                if (em.Exists(rec.sourceChest) &&
+                    em.HasBuffer<ContainedObjectsBuffer>(rec.sourceChest))
+                {
+                    var chestBuf = em.GetBuffer<ContainedObjectsBuffer>(rec.sourceChest);
+
+                    // Prefer the original slot index
+                    if (rec.chestSlotIndex < chestBuf.Length &&
+                        chestBuf[rec.chestSlotIndex].amount == 0)
+                    {
+                        chestBuf[rec.chestSlotIndex] = cur;
+                        returned = true;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < chestBuf.Length; i++)
+                        {
+                            if (chestBuf[i].amount == 0)
+                                { chestBuf[i] = cur; returned = true; break; }
+                        }
+                        if (!returned)
+                            { chestBuf.Add(cur); returned = true; }
+                    }
+                }
+
+                if (returned)
+                {
+                    playerBuf[rec.playerBufAbsoluteIndex] = default;
+                    Debug.Log($"[{NAME}]: Repair: returned {cur.amount}x {cur.objectID} to chest.");
+                }
+                else
+                {
+                    Debug.LogWarning($"[{NAME}]: Repair: source chest gone; {cur.amount}x {cur.objectID} kept in player inventory.");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[{NAME}]: RestoreUnconsumedMaterials error: {ex.Message}");
+        }
+
+        _pendingRestores.Clear();
+    }
 }
