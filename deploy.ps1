@@ -25,7 +25,9 @@ if (Test-Path $Dest) {
     Write-Host "[RangeMod] Removing existing install at: $Dest"
     Remove-Item $Dest -Recurse -Force
 }
-Copy-Item $Staged $ModsDir -Recurse
+# Create dest dir and copy contents directly (avoids double-nesting if Dest survives Remove-Item)
+New-Item -ItemType Directory -Path $Dest -Force | Out-Null
+Copy-Item "$Staged\*" $Dest -Recurse -Force
 Write-Host "[RangeMod] Installed to: $Dest"
 
 # ---- 3. Create distributable zip ----------------------------
