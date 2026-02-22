@@ -1,0 +1,13 @@
+{
+    "guid": "a3f2b7c9d1e04a5f8b6c2d9e3f0a7b4c",
+    "name": "RangeMod",
+    "skipSafetyChecks": false,
+    "disableScripts": false,
+    "accessesExtraAssemblies": true,
+    "disableHarmonyPatching": false,
+    "requiredOn": 1,
+    "files": [
+        { "path": "Scripts/RangeMod.cs" }
+    ],
+    "dependencies": []
+}
