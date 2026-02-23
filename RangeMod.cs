@@ -136,8 +136,10 @@ public class RangeMod : IMod
     //      sandbox forbids reading; at 50f range the ≤3-block offset is negligible).
     //   3. The actual material consumption path (InventoryUpdateSystem → RepairOrReinforce)
     //      is covered by the GetNearbyChestsForCraftingByDistance prefix below.
-    //   4. We also write the extended list back to __instance.cachedNearbyChests so
-    //      any code reading the field directly (bypassing the getter) sees 50f range.
+    //   4. NOTE: We previously attempted to write back to __instance.cachedNearbyChests
+    //      via HarmonyLib.Traverse, but the Roslyn mod sandbox rejects Traverse references.
+    //      Instead we rely on call sites that take the nearby list as a parameter (all
+    //      patched below) plus the getter return value.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
     public static bool GetNearbyChestsPrefix(CraftingHandler __instance, ref List<Entity> __result)
@@ -154,11 +156,6 @@ public class RangeMod : IMod
             _lastCachedPos     = stationPos;
 
         }
-
-        // Also write back to the instance field so any code that reads
-        // handler.cachedNearbyChests directly (bypassing the getter) also
-        // sees our extended-range list.
-        try { Traverse.Create(__instance).Field("cachedNearbyChests").SetValue(cachedNearbyChests); } catch { }
 
         __result = cachedNearbyChests;
         return false; // skip original Burst scan
