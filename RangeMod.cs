@@ -30,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.3";
+    public const string VERSION = "1.1.4";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -135,8 +135,9 @@ public class RangeMod : IMod
     //   2. Origin: player's WorldPosition (station position is in a private field the
     //      sandbox forbids reading; at 50f range the ≤3-block offset is negligible).
     //   3. The actual material consumption path (InventoryUpdateSystem → RepairOrReinforce)
-    //      is covered by the GetNearbyChestsForCraftingByDistance prefix below, so
-    //      no write-back to CraftingHandler.cachedNearbyChests is needed.
+    //      is covered by the GetNearbyChestsForCraftingByDistance prefix below.
+    //   4. We also write the extended list back to __instance.cachedNearbyChests so
+    //      any code reading the field directly (bypassing the getter) sees 50f range.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
     public static bool GetNearbyChestsPrefix(CraftingHandler __instance, ref List<Entity> __result)
@@ -153,6 +154,11 @@ public class RangeMod : IMod
             _lastCachedPos     = stationPos;
 
         }
+
+        // Also write back to the instance field so any code that reads
+        // handler.cachedNearbyChests directly (bypassing the getter) also
+        // sees our extended-range list.
+        try { Traverse.Create(__instance).Field("cachedNearbyChests").SetValue(cachedNearbyChests); } catch { }
 
         __result = cachedNearbyChests;
         return false; // skip original Burst scan
@@ -291,6 +297,20 @@ public class RangeMod : IMod
         _lastCachedPos   = new float3(float.MaxValue, float.MaxValue, float.MaxValue);
     }
 
+    // ── CraftingUIBase.ShowCraftingUI — cache refresh for ALL crafting stations ──
+    // Fires whenever the player opens any generic crafting workbench:
+    //   boat crafting station, potions/explosives, clothes, key crafting,
+    //   music workbench, machine workbench, base building, gear crafting,
+    //   pouch crafting, buildings/components station, paint station,
+    //   equipment workbench, potions workbench, slime workbench, and any
+    //   other CraftingUIBase-derived workbench.
+    // Invalidates the frame+position sentinels so the very next call to
+    // GetNearbyChests() (triggered by the slot-display update) performs a
+    // fresh 50f physics scan from the current player position.
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(CraftingUIBase), "ShowCraftingUI")]
+    public static void CraftingUIBaseShowCraftingUIPrefix() => RefreshCache();
+
     [HarmonyPrefix]
     [HarmonyPatch(typeof(UIManager), "OnPlayerInventoryOpen")]
     public static void OnPlayerInventoryOpenPrefix() => RefreshCache();
@@ -302,6 +322,157 @@ public class RangeMod : IMod
     [HarmonyPrefix]
     [HarmonyPatch(typeof(UIManager), "OnUpgradeForgeOpen")]
     public static void OnUpgradeForgeOpenPrefix() => RefreshCache();
+
+    // ── ProcessResourcesCraftingUI.ActivateRecipeSlot — ECS-path stuffing ─────
+    //
+    // ProcessResourcesCraftingUI queues a Create.ActivateRecipeSlot ECS command
+    // which is consumed by a Burst ISystem with a hard-coded 10f chest scan —
+    // identical to the repair situation.  We apply the same inventory-stuffing
+    // technique:
+    //   Prefix:  determine required materials; move deficit slots from far chests
+    //            (10-50f) into the player's main inventory.
+    //   Vanilla: ECS/Burst job runs, finds parts in player inventory.
+    //   Postfix: coroutine (3 frames later) restores unconsumed parts.
+    //
+    // NOTE: GetRequiredMaterials(false, false) returns requirements for the
+    // currently-highlighted recipe slot.  In the (rare) edge case where the
+    // player clicks a different slot, staged items are simply returned by the
+    // restore coroutine.
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(ProcessResourcesCraftingUI), "ActivateRecipeSlot")]
+    public static void ProcessResourcesActivateSlotPrefix(ProcessResourcesCraftingUI __instance)
+    {
+        _pendingRestores.Clear();
+        try   { ProcessResourcesStageItemsImpl(__instance); }
+        catch (Exception ex)
+            { Debug.LogWarning($"[{NAME}]: ProcessResources prefix error: {ex.Message}"); }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(ProcessResourcesCraftingUI), "ActivateRecipeSlot")]
+    public static void ProcessResourcesActivateSlotPostfix(ProcessResourcesCraftingUI __instance)
+    {
+        if (_pendingRestores.Count > 0)
+            __instance.StartCoroutine(RestoreUnconsumedMaterialsCoroutine());
+    }
+
+    private static void ProcessResourcesStageItemsImpl(ProcessResourcesCraftingUI __instance)
+    {
+        var player = Manager.main?.player;
+        if (player == null) { Debug.Log($"[{NAME}]: ProcessResources: no player"); return; }
+
+        var mats = __instance.GetRequiredMaterials(false, false);
+        if (mats == null || mats.Count == 0)
+        {
+            Debug.Log($"[{NAME}]: ProcessResources: no required materials returned");
+            return;
+        }
+
+        Debug.Log($"[{NAME}]: ProcessResources ActivateSlot: {mats.Count} material type(s) needed");
+
+        var em              = player.querySystem.EntityManager;
+        var invHandler      = player.playerInventoryHandler;
+        var playerInvEntity = invHandler.inventoryEntity;
+        if (!em.HasBuffer<ContainedObjectsBuffer>(playerInvEntity))
+        {
+            Debug.LogWarning($"[{NAME}]: ProcessResources: no ContainedObjectsBuffer on player inventory");
+            return;
+        }
+
+        var playerBuf = em.GetBuffer<ContainedObjectsBuffer>(playerInvEntity);
+        int startPos  = invHandler.startPosInBuffer;
+        int invSize   = invHandler.size;
+
+        var playerHas = new Dictionary<ObjectID, int>();
+        for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
+        {
+            var slot = playerBuf[s];
+            if (slot.amount <= 0) continue;
+            playerHas.TryGetValue(slot.objectID, out int cur);
+            playerHas[slot.objectID] = cur + slot.amount;
+        }
+
+        var playerPos = (float3)player.WorldPosition;
+        var allChests = SearchForNearbyChests(playerPos);
+        var nearHas   = new Dictionary<ObjectID, int>();
+        foreach (var chestEntity in allChests)
+        {
+            if (!em.Exists(chestEntity)) continue;
+            if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
+            var ct = em.GetComponentData<LocalTransform>(chestEntity);
+            if (math.distance(playerPos, ct.Position) > DEFAULT_RANGE + 0.5f) continue;
+            if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
+            var cb = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
+            foreach (var slot in cb)
+            {
+                if (slot.amount <= 0) continue;
+                nearHas.TryGetValue(slot.objectID, out int cur);
+                nearHas[slot.objectID] = cur + slot.amount;
+            }
+        }
+
+        bool staged = false;
+        foreach (var mat in mats)
+        {
+            if (mat.amountNeeded <= 0) continue;
+
+            playerHas.TryGetValue(mat.objectID, out int playerHasCount);
+            nearHas.TryGetValue(mat.objectID, out int nearHasCount);
+            int deficit = mat.amountNeeded - (playerHasCount + nearHasCount);
+
+            Debug.Log($"[{NAME}]: ProcessResources: {mat.objectID} need={mat.amountNeeded} playerHas={playerHasCount} nearHas={nearHasCount} deficit={deficit}");
+
+            if (deficit <= 0) continue;
+
+            foreach (var chestEntity in allChests)
+            {
+                if (deficit <= 0) break;
+                if (!em.Exists(chestEntity)) continue;
+                if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
+                var ct = em.GetComponentData<LocalTransform>(chestEntity);
+                if (math.distance(playerPos, ct.Position) <= DEFAULT_RANGE + 0.5f) continue;
+                if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
+                var chestBuf = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
+
+                for (int i = chestBuf.Length - 1; i >= 0 && deficit > 0; i--)
+                {
+                    var slot = chestBuf[i];
+                    if (slot.objectID != mat.objectID || slot.amount <= 0) continue;
+
+                    int freeAbs = -1;
+                    for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
+                        if (playerBuf[s].amount == 0) { freeAbs = s; break; }
+                    if (freeAbs < 0)
+                    {
+                        Debug.LogWarning($"[{NAME}]: ProcessResources: player inventory full.");
+                        break;
+                    }
+
+                    var saved          = chestBuf[i];
+                    chestBuf[i]        = default;
+                    playerBuf[freeAbs] = saved;
+
+                    _pendingRestores.Add(new MovedItemRecord
+                    {
+                        sourceChest            = chestEntity,
+                        chestSlotIndex         = i,
+                        slotData               = saved,
+                        playerBufAbsoluteIndex = freeAbs
+                    });
+
+                    deficit -= saved.amount;
+                    staged   = true;
+                    Debug.Log($"[{NAME}]: ProcessResources staged: {saved.amount}x {saved.objectID} -> player[{freeAbs}], deficit={deficit}");
+                }
+            }
+        }
+
+        if (staged)
+            Debug.Log($"[{NAME}]: ProcessResources: staged {_pendingRestores.Count} slot(s) from far chests into player inventory.");
+        else
+            Debug.Log($"[{NAME}]: ProcessResources: nothing to stage (all materials reachable within {DEFAULT_RANGE}f).");
+    }
 
     // ---- Repair range extension ---------------------------------------------
     //
