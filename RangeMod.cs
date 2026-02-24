@@ -30,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.8";
+    public const string VERSION = "1.1.11";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -143,8 +143,8 @@ public class RangeMod : IMod
     // Harmony field ref for the private CraftingHandler.cachedNearbyChests field — avoiding
     // HarmonyLib.Traverse (blocked by the sandbox). This lets any direct field readers see
     // the extended 50f list.
-    private static readonly AccessTools.FieldRef<CraftingHandler, List<Entity>> _handlerCachedNearbyChests
-        = AccessTools.FieldRefAccess<CraftingHandler, List<Entity>>("cachedNearbyChests");
+    // NOTE: Direct field access via HarmonyLib.AccessTools.FieldRefAccess is forbidden in the Roslyn mod sandbox.
+    // Only patch methods and rely on the getter/setter and parameters.
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
@@ -160,12 +160,7 @@ public class RangeMod : IMod
             cachedNearbyChests = SearchForNearbyChests(stationPos);
             _lastCachedFrame   = currentFrame;
             _lastCachedPos     = stationPos;
-
         }
-
-        // Write through to the instance field so any callers that read the field directly
-        // (instead of the getter) also see the extended-range list.
-        try { _handlerCachedNearbyChests(__instance) = cachedNearbyChests; } catch { }
 
         __result = cachedNearbyChests;
         return false; // skip original Burst scan
@@ -335,6 +330,206 @@ public class RangeMod : IMod
     public static void OnUpgradeForgeOpenPrefix() => RefreshCache();
 
     // ── ProcessResourcesCraftingUI.ActivateRecipeSlot — ECS-path stuffing ─────
+        // ── Managed workbench ActivateRecipeSlot — inventory stuffing for all benches ──
+        // Covers SimpleCraftingUI, SimpleCraftingUIContainer, CookingCraftingUI, UpgradeForgeUI, etc.
+        // These benches use managed ActivateRecipeSlot methods, but the actual crafting execution
+        // still uses a Burst job with a hardcoded 10f chest scan. We apply the same inventory-stuffing
+        // technique as for ProcessResourcesCraftingUI and SalvageAndRepairUI.
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(SimpleCraftingUI), "ActivateRecipeSlot")]
+        public static void SimpleCraftingUIActivateSlotPrefix(SimpleCraftingUI __instance)
+        {
+            _pendingRestores.Clear();
+            try   { ManagedWorkbenchStageItemsImpl(__instance); }
+            catch (Exception ex)
+                { Debug.LogWarning($"[{NAME}]: SimpleCraftingUI prefix error: {ex.Message}"); }
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(SimpleCraftingUI), "ActivateRecipeSlot")]
+        public static void SimpleCraftingUIActivateSlotPostfix(SimpleCraftingUI __instance)
+        {
+            if (_pendingRestores.Count > 0)
+                __instance.StartCoroutine(RestoreUnconsumedMaterialsCoroutine());
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(SimpleCraftingUIContainer), "ActivateRecipeSlot")]
+        public static void SimpleCraftingUIContainerActivateSlotPrefix(SimpleCraftingUIContainer __instance)
+        {
+            _pendingRestores.Clear();
+            try   { ManagedWorkbenchStageItemsImpl(__instance); }
+            catch (Exception ex)
+                { Debug.LogWarning($"[{NAME}]: SimpleCraftingUIContainer prefix error: {ex.Message}"); }
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(SimpleCraftingUIContainer), "ActivateRecipeSlot")]
+        public static void SimpleCraftingUIContainerActivateSlotPostfix(SimpleCraftingUIContainer __instance)
+        {
+            if (_pendingRestores.Count > 0)
+                __instance.StartCoroutine(RestoreUnconsumedMaterialsCoroutine());
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(CookingCraftingUI), "ActivateRecipeSlot")]
+        public static void CookingCraftingUIActivateSlotPrefix(CookingCraftingUI __instance)
+        {
+            _pendingRestores.Clear();
+            try   { ManagedWorkbenchStageItemsImpl(__instance); }
+            catch (Exception ex)
+                { Debug.LogWarning($"[{NAME}]: CookingCraftingUI prefix error: {ex.Message}"); }
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(CookingCraftingUI), "ActivateRecipeSlot")]
+        public static void CookingCraftingUIActivateSlotPostfix(CookingCraftingUI __instance)
+        {
+            if (_pendingRestores.Count > 0)
+                __instance.StartCoroutine(RestoreUnconsumedMaterialsCoroutine());
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(UpgradeForgeUI), "ActivateRecipeSlot")]
+        public static void UpgradeForgeUIActivateSlotPrefix(UpgradeForgeUI __instance)
+        {
+            _pendingRestores.Clear();
+            try   { ManagedWorkbenchStageItemsImpl(__instance); }
+            catch (Exception ex)
+                { Debug.LogWarning($"[{NAME}]: UpgradeForgeUI prefix error: {ex.Message}"); }
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(UpgradeForgeUI), "ActivateRecipeSlot")]
+        public static void UpgradeForgeUIActivateSlotPostfix(UpgradeForgeUI __instance)
+        {
+            if (_pendingRestores.Count > 0)
+                __instance.StartCoroutine(RestoreUnconsumedMaterialsCoroutine());
+        }
+
+        // Shared implementation for managed benches
+        private static void ManagedWorkbenchStageItemsImpl(object uiInstance)
+        {
+            var player = Manager.main?.player;
+            if (player == null) { Debug.Log($"[{NAME}]: ManagedWorkbench: no player"); return; }
+
+            // Try to get required materials from the UI instance
+            var mats = (uiInstance.GetType().GetMethod("GetRequiredMaterials")?.Invoke(uiInstance, new object[] { false, false }) as IList);
+            if (mats == null || mats.Count == 0)
+            {
+                Debug.Log($"[{NAME}]: ManagedWorkbench: no required materials returned");
+                return;
+            }
+
+            Debug.Log($"[{NAME}]: ManagedWorkbench ActivateSlot: {mats.Count} material type(s) needed");
+
+            var em              = player.querySystem.EntityManager;
+            var invHandler      = player.playerInventoryHandler;
+            var playerInvEntity = invHandler.inventoryEntity;
+            if (!em.HasBuffer<ContainedObjectsBuffer>(playerInvEntity))
+            {
+                Debug.LogWarning($"[{NAME}]: ManagedWorkbench: no ContainedObjectsBuffer on player inventory");
+                return;
+            }
+
+            var playerBuf = em.GetBuffer<ContainedObjectsBuffer>(playerInvEntity);
+            int startPos  = invHandler.startPosInBuffer;
+            int invSize   = invHandler.size;
+
+            var playerHas = new Dictionary<ObjectID, int>();
+            for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
+            {
+                var slot = playerBuf[s];
+                if (slot.amount <= 0) continue;
+                playerHas.TryGetValue(slot.objectID, out int cur);
+                playerHas[slot.objectID] = cur + slot.amount;
+            }
+
+            var playerPos = (float3)player.WorldPosition;
+            var allChests = SearchForNearbyChests(playerPos);
+            var nearHas   = new Dictionary<ObjectID, int>();
+            foreach (var chestEntity in allChests)
+            {
+                if (!em.Exists(chestEntity)) continue;
+                if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
+                var ct = em.GetComponentData<LocalTransform>(chestEntity);
+                if (math.distance(playerPos, ct.Position) > DEFAULT_RANGE + 0.5f) continue;
+                if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
+                var cb = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
+                foreach (var slot in cb)
+                {
+                    if (slot.amount <= 0) continue;
+                    nearHas.TryGetValue(slot.objectID, out int cur);
+                    nearHas[slot.objectID] = cur + slot.amount;
+                }
+            }
+
+            bool staged = false;
+            foreach (var mat in mats)
+            {
+                // mat is a boxed struct; use reflection to get fields
+                var matType = mat.GetType();
+                var objectID = (ObjectID)matType.GetField("objectID")?.GetValue(mat);
+                var amountNeeded = (int)matType.GetField("amountNeeded")?.GetValue(mat);
+                if (amountNeeded <= 0) continue;
+
+                playerHas.TryGetValue(objectID, out int playerHasCount);
+                nearHas.TryGetValue(objectID, out int nearHasCount);
+                int deficit = amountNeeded - (playerHasCount + nearHasCount);
+
+                Debug.Log($"[{NAME}]: ManagedWorkbench: {objectID} need={amountNeeded} playerHas={playerHasCount} nearHas={nearHasCount} deficit={deficit}");
+
+                if (deficit <= 0) continue;
+
+                foreach (var chestEntity in allChests)
+                {
+                    if (deficit <= 0) break;
+                    if (!em.Exists(chestEntity)) continue;
+                    if (!em.HasComponent<LocalTransform>(chestEntity)) continue;
+                    var ct = em.GetComponentData<LocalTransform>(chestEntity);
+                    if (math.distance(playerPos, ct.Position) <= DEFAULT_RANGE + 0.5f) continue;
+                    if (!em.HasBuffer<ContainedObjectsBuffer>(chestEntity)) continue;
+                    var chestBuf = em.GetBuffer<ContainedObjectsBuffer>(chestEntity);
+
+                    for (int i = chestBuf.Length - 1; i >= 0 && deficit > 0; i--)
+                    {
+                        var slot = chestBuf[i];
+                        if (slot.objectID != objectID || slot.amount <= 0) continue;
+
+                        int freeAbs = -1;
+                        for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
+                            if (playerBuf[s].amount == 0) { freeAbs = s; break; }
+                        if (freeAbs < 0)
+                        {
+                            Debug.LogWarning($"[{NAME}]: ManagedWorkbench: player inventory full.");
+                            break;
+                        }
+
+                        var saved          = chestBuf[i];
+                        chestBuf[i]        = default;
+                        playerBuf[freeAbs] = saved;
+
+                        _pendingRestores.Add(new MovedItemRecord
+                        {
+                            sourceChest            = chestEntity,
+                            chestSlotIndex         = i,
+                            slotData               = saved,
+                            playerBufAbsoluteIndex = freeAbs
+                        });
+
+                        deficit -= saved.amount;
+                        staged   = true;
+                        Debug.Log($"[{NAME}]: ManagedWorkbench staged: {saved.amount}x {saved.objectID} -> player[{freeAbs}], deficit={deficit}");
+                    }
+                }
+            }
+
+            if (staged)
+                Debug.Log($"[{NAME}]: ManagedWorkbench: staged {_pendingRestores.Count} slot(s) from far chests into player inventory.");
+            else
+                Debug.Log($"[{NAME}]: ManagedWorkbench: nothing to stage (all materials reachable within {DEFAULT_RANGE}f).");
+        }
     //
     // ProcessResourcesCraftingUI queues a Create.ActivateRecipeSlot ECS command
     // which is consumed by a Burst ISystem with a hard-coded 10f chest scan —
