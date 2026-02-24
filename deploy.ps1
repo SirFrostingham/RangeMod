@@ -22,7 +22,26 @@ if (-not (Test-Path $secretsFile)) {
 $ModioGameId  = 5289
 $ModioModId   = 5811900
 
-# ---- 1. Build the staged layout in the source tree ----------
+# ---- 1. Read and bump version, then stage layout -------------
+# Read the version string from the source file and bump patch automatically on deploy.
+$versionLine = Get-Content "$Source\RangeMod.cs" | Select-String 'VERSION\s*=\s*"([^"]+)"'
+if (-not $versionLine) { throw "Could not read VERSION from RangeMod.cs" }
+$oldVersion = $versionLine.Matches[0].Groups[1].Value
+$parts = $oldVersion -split '\.'
+if ($parts.Length -lt 3) { throw "VERSION format unexpected: $oldVersion" }
+$parts[-1] = [int]$parts[-1] + 1
+$newVersion = ($parts -join '.')
+# Update RangeMod.cs with the bumped version
+# Simpler regex: replace any VERSION = "x.y.z" line
+$versionPattern = 'VERSION\s*=\s*"[^"]+"'
+$versionReplacement = "VERSION = `"$newVersion`""
+(Get-Content "$Source\RangeMod.cs") |
+    ForEach-Object { $_ -replace $versionPattern, $versionReplacement } |
+    Set-Content "$Source\RangeMod.cs"
+
+Write-Host "[RangeMod] Version bumped: $oldVersion -> $newVersion"
+
+# ---- Build the staged layout
 $Staged = "$Source\_staged\$ModName"
 if (Test-Path $Staged) { Remove-Item $Staged -Recurse -Force }
 New-Item -ItemType Directory -Path "$Staged\Scripts" | Out-Null

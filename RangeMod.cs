@@ -30,7 +30,7 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.4";
+    public const string VERSION = "1.1.8";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
@@ -140,6 +140,12 @@ public class RangeMod : IMod
     //      via HarmonyLib.Traverse, but the Roslyn mod sandbox rejects Traverse references.
     //      Instead we rely on call sites that take the nearby list as a parameter (all
     //      patched below) plus the getter return value.
+    // Harmony field ref for the private CraftingHandler.cachedNearbyChests field — avoiding
+    // HarmonyLib.Traverse (blocked by the sandbox). This lets any direct field readers see
+    // the extended 50f list.
+    private static readonly AccessTools.FieldRef<CraftingHandler, List<Entity>> _handlerCachedNearbyChests
+        = AccessTools.FieldRefAccess<CraftingHandler, List<Entity>>("cachedNearbyChests");
+
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingHandler), "GetNearbyChests")]
     public static bool GetNearbyChestsPrefix(CraftingHandler __instance, ref List<Entity> __result)
@@ -157,9 +163,17 @@ public class RangeMod : IMod
 
         }
 
+        // Write through to the instance field so any callers that read the field directly
+        // (instead of the getter) also see the extended-range list.
+        try { _handlerCachedNearbyChests(__instance) = cachedNearbyChests; } catch { }
+
         __result = cachedNearbyChests;
         return false; // skip original Burst scan
     }
+
+    // Managed crafting path: InventoryUtility.ActivateRecipeSlot is called for managed benches.
+    // NOTE: Do not patch here—Roslyn sandbox rejects these attributes. Managed benches rely on
+    // CraftingHandler patches (parameters) and cachedNearbyChests field write-through.
 
     // EXECUTION PATH FIX:
     // InventoryUpdateSystem::ProcessInventoryChange calls

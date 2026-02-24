@@ -6,5 +6,6 @@ tools/
 
 # Build artifacts
 _staged/
+inspect*.txt
 *.zip
 RangeMod.zip
