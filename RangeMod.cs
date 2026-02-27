@@ -15,9 +15,9 @@ using Debug = UnityEngine.Debug;
 
 /// <summary>
 /// RangeMod — Extended Crafting Range
-/// Extends the crafting workbench nearby-chest search range to 5× the game default.
+/// Extends the crafting workbench nearby-chest search range to 20× the game default.
 ///
-/// Game default (v1.1.2.8): 10f units.  This mod sets it to 50f.
+/// Game default (v1.1.2.8): 10f units.  This mod sets it to 200f.
 ///
 /// Implementation notes:
 ///   - Core Keeper 1.1+ uses ECS — nearby chests are List&lt;Entity&gt;, not List&lt;Chest&gt;.
@@ -30,14 +30,14 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.4";
+    public const string VERSION = "1.1.6";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
     // Game default crafting chest scan radius (confirmed from IL: ldc.r4 10).
     private const float DEFAULT_RANGE = 10f;
-    private const float RANGE_MULTIPLIER = 5f;
-    private static readonly float EXTENDED_RANGE = DEFAULT_RANGE * RANGE_MULTIPLIER; // 50f
+    private const float RANGE_MULTIPLIER = 20f;
+    private static readonly float EXTENDED_RANGE = DEFAULT_RANGE * RANGE_MULTIPLIER; // 200f
 
     // Upper bound on how many chests to include. 200 is generous for any base layout.
     private const int MAX_CHESTS = 200;
@@ -115,7 +115,7 @@ public class RangeMod : IMod
     // Returns the search origin for the nearby-chest scan.
     // The game's Roslyn sandbox blocks System.Reflection entirely, so we cannot
     // read CraftingHandler.entityMonoBehaviour directly. We use the player's
-    // position instead — at 50f range the ≤3-block station-vs-player offset is
+    // position instead — at 200f range the ≤3-block station-vs-player offset is
     // negligible and the cache is invalidated whenever the player moves.
     private static float3 GetStationPosition(CraftingHandler instance)
     {
