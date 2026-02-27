@@ -5,7 +5,7 @@
     "disableScripts": false,
     "accessesExtraAssemblies": true,
     "disableHarmonyPatching": false,
-    "requiredOn": 1,
+    "requiredOn": 3,
     "files": [
         { "path": "Scripts/RangeMod.cs" }
     ],
