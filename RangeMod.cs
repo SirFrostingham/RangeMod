@@ -15,9 +15,9 @@ using Debug = UnityEngine.Debug;
 
 /// <summary>
 /// RangeMod — Extended Crafting Range
-/// Extends the crafting workbench nearby-chest search range to 20× the game default.
+/// Extends the crafting workbench nearby-chest search range to 10× the game default.
 ///
-/// Game default (v1.1.2.8): 10f units.  This mod sets it to 200f.
+/// Game default (v1.1.2.8): 10f units.  This mod sets it to 100f.
 ///
 /// Implementation notes:
 ///   - Core Keeper 1.1+ uses ECS — nearby chests are List&lt;Entity&gt;, not List&lt;Chest&gt;.
@@ -30,17 +30,21 @@ using Debug = UnityEngine.Debug;
 [Harmony]
 public class RangeMod : IMod
 {
-    public const string VERSION = "1.1.7";
+    public const string VERSION = "1.1.9";
     public const string NAME = "RangeMod";
     public const string AUTHOR = "Aaron Reed";
 
     // Game default crafting chest scan radius (confirmed from IL: ldc.r4 10).
     private const float DEFAULT_RANGE = 10f;
-    private const float RANGE_MULTIPLIER = 20f;
-    private static readonly float EXTENDED_RANGE = DEFAULT_RANGE * RANGE_MULTIPLIER; // 200f
+    private const float RANGE_MULTIPLIER = 10f;
+    private static readonly float EXTENDED_RANGE = DEFAULT_RANGE * RANGE_MULTIPLIER; // 100f
 
-    // Upper bound on how many chests to include. 200 is generous for any base layout.
-    private const int MAX_CHESTS = 200;
+    // Upper bound on nearby inventories to include in scans.
+    //
+    // IMPORTANT: This must be high enough to avoid truncating very large storage rooms,
+    // otherwise some item types can appear to "randomly" fail quick-deposit or crafting
+    // pull simply because their chest was outside the capped list.
+    private const int MAX_NEARBY_INVENTORIES = 4096;
 
     // Nearby-chest cache. Rebuilt at most once per frame, or when position changes.
     // Mirrors the vanilla GetNearbyChests frame+position caching logic.
@@ -100,11 +104,14 @@ public class RangeMod : IMod
         // chest lookup. We pass EXTENDED_RANGE instead of the default 10f.
         var nativeList = InventoryUtility.GetNearbyChestsByDistance(
             originPosition, collisionWorld, invLookup, transformLookup,
-            EXTENDED_RANGE, MAX_CHESTS, Allocator.TempJob);
+            EXTENDED_RANGE, MAX_NEARBY_INVENTORIES, Allocator.TempJob);
 
         var result = new List<Entity>(nativeList.Length);
         foreach (var entity in nativeList)
             result.Add(entity);
+
+        if (nativeList.Length >= MAX_NEARBY_INVENTORIES)
+            Debug.LogWarning($"[{NAME}]: Nearby inventory scan reached cap ({MAX_NEARBY_INVENTORIES}). Some farther chests may be excluded.");
 
         nativeList.Dispose();
 
@@ -115,7 +122,7 @@ public class RangeMod : IMod
     // Returns the search origin for the nearby-chest scan.
     // The game's Roslyn sandbox blocks System.Reflection entirely, so we cannot
     // read CraftingHandler.entityMonoBehaviour directly. We use the player's
-    // position instead — at 200f range the ≤3-block station-vs-player offset is
+    // position instead — at 100f range the ≤3-block station-vs-player offset is
     // negligible and the cache is invalidated whenever the player moves.
     private static float3 GetStationPosition(CraftingHandler instance)
     {
@@ -131,9 +138,9 @@ public class RangeMod : IMod
     // "nearby". We replace it entirely so it returns our extended list.
     //
     // Critical fixes vs vanilla:
-    //   1. Range: 50f instead of hardcoded 10f.
+    //   1. Range: EXTENDED_RANGE instead of hardcoded 10f.
     //   2. Origin: player's WorldPosition (station position is in a private field the
-    //      sandbox forbids reading; at 50f range the ≤3-block offset is negligible).
+    //      sandbox forbids reading; at extended range the ≤3-block offset is negligible).
     //   3. The actual material consumption path (InventoryUpdateSystem → RepairOrReinforce)
     //      is covered by the GetNearbyChestsForCraftingByDistance prefix below.
     //   4. NOTE: We previously attempted to write back to __instance.cachedNearbyChests
@@ -173,7 +180,7 @@ public class RangeMod : IMod
     // By prefixing here we intercept BOTH the display call (GetNearbyChests → here) AND the
     // execution call (ProcessInventoryChange → here) in a single patch.  The position,
     // physics world, and component lookups are already provided as parameters, so we can do
-    // a 50f scan without any reference to Manager.main or the player.
+    // an extended-range scan without any reference to Manager.main or the player.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(InventoryUtility), "GetNearbyChestsForCraftingByDistance")]
     public static bool GetNearbyChestsForCraftingByDistancePrefix(
@@ -188,11 +195,15 @@ public class RangeMod : IMod
         var extended = InventoryUtility.GetNearbyChestsByDistance(
             position, collisionWorld,
             inventoryAutoTransferEnabledLookup, localTransformLookup,
-            EXTENDED_RANGE, MAX_CHESTS, Allocator.TempJob);
+            EXTENDED_RANGE, MAX_NEARBY_INVENTORIES, Allocator.TempJob);
 
         inventories.Clear();
         for (int i = 0; i < extended.Length; i++)
             inventories.Add(extended[i]);
+
+        if (extended.Length >= MAX_NEARBY_INVENTORIES)
+            Debug.LogWarning($"[{NAME}]: Crafting scan reached cap ({MAX_NEARBY_INVENTORIES}). Some farther chests may be excluded.");
+
         extended.Dispose();
 
         Debug.Log($"[{NAME}]: Crafting execution scan: {inventories.Length} chest(s) in {EXTENDED_RANGE}u @ {position}.");
@@ -202,7 +213,7 @@ public class RangeMod : IMod
     // GetNearbyChestsForAutoStackingByDistance is the managed (non-Burst) method
     // that builds the chest list for the Q quick-deposit action. It has no
     // maxDistance parameter (range is hard-coded inside). We replace it entirely
-    // with a 50f scan using GetNearbyChestsByDistance.
+    // with an extended-range scan using GetNearbyChestsByDistance.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(InventoryUtility), "GetNearbyChestsForAutoStackingByDistance")]
     public static bool GetNearbyChestsForAutoStackingByDistancePrefix(
@@ -216,7 +227,11 @@ public class RangeMod : IMod
         __result = InventoryUtility.GetNearbyChestsByDistance(
             position, collisionWorld,
             inventoryAutoTransferEnabledLookup, localTransformLookup,
-            EXTENDED_RANGE, MAX_CHESTS, allocator);
+            EXTENDED_RANGE, MAX_NEARBY_INVENTORIES, allocator);
+
+        if (__result.Length >= MAX_NEARBY_INVENTORIES)
+            Debug.LogWarning($"[{NAME}]: Quick-deposit scan reached cap ({MAX_NEARBY_INVENTORIES}). Some farther chests may be excluded.");
+
         Debug.Log($"[{NAME}]: Quick-deposit scan: {__result.Length} chest(s) in {EXTENDED_RANGE}u @ {position}.");
         return false; // skip the hardcoded-range original
     }
@@ -303,7 +318,7 @@ public class RangeMod : IMod
     //   other CraftingUIBase-derived workbench.
     // Invalidates the frame+position sentinels so the very next call to
     // GetNearbyChests() (triggered by the slot-display update) performs a
-    // fresh 50f physics scan from the current player position.
+    // fresh extended-range physics scan from the current player position.
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CraftingUIBase), "ShowCraftingUI")]
     public static void CraftingUIBaseShowCraftingUIPrefix() => RefreshCache();
@@ -327,7 +342,7 @@ public class RangeMod : IMod
     // identical to the repair situation.  We apply the same inventory-stuffing
     // technique:
     //   Prefix:  determine required materials; move deficit slots from far chests
-    //            (10-50f) into the player's main inventory.
+    //            (DEFAULT_RANGE to EXTENDED_RANGE) into the player's main inventory.
     //   Vanilla: ECS/Burst job runs, finds parts in player inventory.
     //   Postfix: coroutine (3 frames later) restores unconsumed parts.
     //
@@ -483,7 +498,7 @@ public class RangeMod : IMod
     // Since everything downstream of ToggleRepair is Burst-compiled and
     // Harmony-unpatchable, the fix is "inventory stuffing":
     //   Prefix:  detect which scrap parts are short; move whole slots from
-    //            far chests (10-50f) into the player's main inventory.
+    //            far chests (DEFAULT_RANGE to EXTENDED_RANGE) into the player's main inventory.
     //   Vanilla: repair Burst job runs, finds the parts in player inventory.
     //   Postfix: coroutine (3 frames later) moves any unconsumed parts back
     //            to their original chest slots.
@@ -530,7 +545,7 @@ public class RangeMod : IMod
 
         // Count how much of each required material the player currently holds.
         // We do NOT trust mat.amountAvailable because our GetNearbyChests patch
-        // makes it count the full 50f radius, but the repair Burst job only
+        // makes it count the full EXTENDED_RANGE radius, but the repair Burst job only
         // scans 10f - so the game shows "enough" even when the actual job fails.
         var playerHas = new Dictionary<ObjectID, int>();
         for (int s = startPos; s < startPos + invSize && s < playerBuf.Length; s++)
@@ -544,7 +559,7 @@ public class RangeMod : IMod
 
         // Also count what's in near chests (<=10f) so we don't over-stage.
         var playerPos  = (float3)player.WorldPosition;
-        var allChests  = SearchForNearbyChests(playerPos); // 50f scan (cached)
+        var allChests  = SearchForNearbyChests(playerPos); // extended-range scan (cached)
         var nearHas    = new Dictionary<ObjectID, int>();
         foreach (var chestEntity in allChests)
         {

@@ -1,10 +1,10 @@
 # RangeMod — Extended Crafting Range
 
-A mod for **Core Keeper** that extends the crafting workbench's nearby-chest search radius to **5× the vanilla range** (50 units vs. the default 10), so you can craft from materials stored in chests without carrying them in your inventory.
+A mod for **Core Keeper** that extends the crafting workbench's nearby-chest search radius to **10× the vanilla range** (100 units vs. the default 10), so you can craft from materials stored in chests without carrying them in your inventory.
 
 ## What it does
 
-When you open a crafting station (workbench, cooking pot, furnace, anvil, etc.), Core Keeper normally searches for chests within **10 units** of the workstation. This mod expands that radius to **50 units**, letting you keep your materials stored neatly in nearby chests and craft directly from them.
+When you open a crafting station (workbench, cooking pot, furnace, anvil, etc.), Core Keeper normally searches for chests within **10 units** of the workstation. This mod expands that radius to **100 units**, letting you keep your materials stored neatly in nearby chests and craft directly from them.
 
 Works with all crafting station types:
 - Workbenches (all tiers)
@@ -67,7 +67,7 @@ To change the range multiplier, edit the constants at the top of `RangeMod.cs`:
 
 ```csharp
 private const float DEFAULT_RANGE    = 10f;  // vanilla game value — don't change
-private const float RANGE_MULTIPLIER = 5f;   // change this  →  50f total range
+private const float RANGE_MULTIPLIER = 10f;  // change this  →  100f total range
 private const int   MAX_CHESTS       = 200;  // max chests scanned per open
 ```
 
@@ -81,7 +81,7 @@ This mod uses **Harmony** to:
 
 1. **Replace `CraftingHandler.GetNearbyChests()`** — patched to skip the original Burst scan entirely and return our pre-built list instead.
 2. **Inject the extended list** into every `CraftingHandler` method that accepts a `nearbyChestsToTakeMaterialsFrom` parameter.
-3. **Rebuild the cache** each time the player opens the crafting UI (`UIManager.OnPlayerInventoryOpen`), calling `InventoryUtility.GetNearbyChestsByDistance` with `50f` instead of `10f`.
+3. **Rebuild the cache** each time the player opens the crafting UI (`UIManager.OnPlayerInventoryOpen`), calling `InventoryUtility.GetNearbyChestsByDistance` with `100f` instead of `10f`.
 
 ## License
 
